@@ -76,9 +76,54 @@ pub fn parse_slash_name(line: &str) -> Option<(&str, &str)> {
     Some((name, rest))
 }
 
-/// Parse positional arguments using shlex semantics (supports quoted tokens).
+/// Parse positional arguments with double-quote grouping, backslash escapes,
+/// but literal single quotes.
+///
+/// This custom parser supports:
+/// - Double quotes (`"`) group tokens containing spaces: `"docs/My File.md"` → single arg
+/// - Backslash escapes: `\"` → literal `"`, `\\` → literal `\`, `\ ` → literal space
+/// - Single quotes (`'`) are literal characters: `what's` → preserved as-is
+/// - Whitespace outside quotes splits tokens
+/// - Quote characters are stripped from output
+///
+/// This allows natural language (`what's going on?`), quoted paths
+/// (`"path/with spaces.txt"`), and escape sequences (`file\ name.txt`)
+/// to all work correctly.
 pub fn parse_positional_args(rest: &str) -> Vec<String> {
-    Shlex::new(rest).collect()
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escape_next = false;
+
+    for ch in rest.chars() {
+        if escape_next {
+            current.push(ch);
+            escape_next = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escape_next = true,
+            '"' => in_quotes = !in_quotes,
+            _ if ch.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    // Handle trailing backslash - include it literally
+    if escape_next {
+        current.push('\\');
+    }
+
+    if !current.is_empty() {
+        args.push(current);
+    }
+
+    args
 }
 
 /// Extracts the unique placeholder variable names from a prompt template.
@@ -187,7 +232,7 @@ pub fn expand_custom_prompt(
     }
 
     // Otherwise, treat it as numeric/positional placeholder prompt (or none).
-    let pos_args: Vec<String> = Shlex::new(rest).collect();
+    let pos_args = parse_positional_args(rest);
     let expanded = expand_numeric_placeholders(&prompt.content, &pos_args);
     Ok(Some(expanded))
 }
@@ -402,5 +447,65 @@ mod tests {
 
         let out = expand_custom_prompt("/prompts:my-prompt", &prompts).unwrap();
         assert_eq!(out, Some("literal $$USER".to_string()));
+    }
+
+    #[test]
+    fn arguments_with_apostrophe() {
+        let prompts = vec![CustomPrompt {
+            name: "test".to_string(),
+            path: "/tmp/test.md".to_string().into(),
+            content: "Plan: $ARGUMENTS".to_string(),
+            description: None,
+            argument_hint: None,
+        }];
+
+        let out = expand_custom_prompt("/prompts:test what's going on, codex?", &prompts).unwrap();
+        assert_eq!(out, Some("Plan: what's going on, codex?".to_string()));
+    }
+
+    #[test]
+    fn arguments_with_question_mark() {
+        let prompts = vec![CustomPrompt {
+            name: "test".to_string(),
+            path: "/tmp/test.md".to_string().into(),
+            content: "Question: $ARGUMENTS".to_string(),
+            description: None,
+            argument_hint: None,
+        }];
+
+        let out = expand_custom_prompt("/prompts:test how do I fix this?", &prompts).unwrap();
+        assert_eq!(out, Some("Question: how do I fix this?".to_string()));
+    }
+
+    #[test]
+    fn arguments_strips_quotes_for_grouping() {
+        // Double quotes group tokens with spaces, but quotes are stripped.
+        let prompts = vec![CustomPrompt {
+            name: "test".to_string(),
+            path: "/tmp/test.md".to_string().into(),
+            content: "Input: $ARGUMENTS".to_string(),
+            description: None,
+            argument_hint: None,
+        }];
+
+        let out =
+            expand_custom_prompt("/prompts:test \"quoted text\" here", &prompts).unwrap();
+        assert_eq!(out, Some("Input: quoted text here".to_string()));
+    }
+
+    #[test]
+    fn arguments_groups_path_with_spaces() {
+        // Paths with spaces can be quoted to form single argument.
+        let prompts = vec![CustomPrompt {
+            name: "review".to_string(),
+            path: "/tmp/review.md".to_string().into(),
+            content: "Review file: $1".to_string(),
+            description: None,
+            argument_hint: None,
+        }];
+
+        let out =
+            expand_custom_prompt("/prompts:review \"docs/My File.md\"", &prompts).unwrap();
+        assert_eq!(out, Some("Review file: docs/My File.md".to_string()));
     }
 }

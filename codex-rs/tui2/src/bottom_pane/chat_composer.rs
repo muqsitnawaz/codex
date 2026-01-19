@@ -653,9 +653,8 @@ impl ChatComposer {
                                 .trim_start()
                                 .starts_with(&format!("/{}", cmd.command()));
                             if !starts_with_cmd {
-                                self.textarea.set_text(&format!("/{} ", cmd.command()));
-                            }
-                            if !self.textarea.text().is_empty() {
+                                self.insert_slash_command(&format!("/{}", cmd.command()));
+                            } else if !self.textarea.text().is_empty() {
                                 cursor_target = Some(self.textarea.text().len());
                             }
                         }
@@ -666,10 +665,8 @@ impl ChatComposer {
                                     first_line,
                                     PromptSelectionMode::Completion,
                                 ) {
-                                    PromptSelectionAction::Insert { text, cursor } => {
-                                        let target = cursor.unwrap_or(text.len());
-                                        self.textarea.set_text(&text);
-                                        cursor_target = Some(target);
+                                    PromptSelectionAction::Insert { text, cursor: _ } => {
+                                        self.insert_slash_command(&text);
                                     }
                                     PromptSelectionAction::Submit { .. } => {}
                                 }
@@ -718,10 +715,8 @@ impl ChatComposer {
                                         self.textarea.set_text("");
                                         return (InputResult::Submitted(text), true);
                                     }
-                                    PromptSelectionAction::Insert { text, cursor } => {
-                                        let target = cursor.unwrap_or(text.len());
-                                        self.textarea.set_text(&text);
-                                        self.textarea.set_cursor(target);
+                                    PromptSelectionAction::Insert { text, cursor: _ } => {
+                                        self.insert_slash_command(&text);
                                         return (InputResult::None, true);
                                     }
                                 }
@@ -1235,6 +1230,45 @@ impl ChatComposer {
 
         self.textarea.set_text(&new_text);
         let new_cursor = start_idx.saturating_add(inserted.len()).saturating_add(1);
+        self.textarea.set_cursor(new_cursor);
+    }
+
+    /// Replace the active slash command token (starting with `/`) with the completed command.
+    ///
+    /// This preserves any text before and after the slash command token, only replacing
+    /// the token itself. Used for Tab/Enter completion on slash commands.
+    fn insert_slash_command(&mut self, command: &str) {
+        let cursor_offset = self.textarea.cursor();
+        let text = self.textarea.text();
+        let safe_cursor = Self::clamp_to_char_boundary(text, cursor_offset);
+
+        let before_cursor = &text[..safe_cursor];
+        let after_cursor = &text[safe_cursor..];
+
+        // Find the start of the slash command (the `/` character).
+        let start_idx = before_cursor
+            .char_indices()
+            .rfind(|(_, c)| *c == '/')
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        // Find the end of the current token.
+        let end_rel_idx = after_cursor
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(idx, _)| idx)
+            .unwrap_or(after_cursor.len());
+        let end_idx = safe_cursor + end_rel_idx;
+
+        // Build new text preserving everything outside the token.
+        let mut new_text =
+            String::with_capacity(text.len() - (end_idx - start_idx) + command.len());
+        new_text.push_str(&text[..start_idx]);
+        new_text.push_str(command);
+        new_text.push_str(&text[end_idx..]);
+
+        self.textarea.set_text(&new_text);
+        let new_cursor = start_idx.saturating_add(command.len());
         self.textarea.set_cursor(new_cursor);
     }
 
@@ -3453,7 +3487,9 @@ mod tests {
     }
 
     #[test]
-    fn extract_args_supports_quoted_paths_single_arg() {
+    fn extract_args_groups_double_quoted_tokens() {
+        // Double quotes group tokens with spaces, quotes are stripped.
+        // Single quotes (apostrophes) are literal for natural language.
         let args = extract_positional_args_for_prompt_line(
             "/prompts:review \"docs/My File.md\"",
             "review",
@@ -3462,10 +3498,14 @@ mod tests {
     }
 
     #[test]
-    fn extract_args_supports_mixed_quoted_and_unquoted() {
+    fn extract_args_mixed_quoted_and_unquoted() {
+        // Double quotes group, unquoted tokens split on whitespace.
         let args =
             extract_positional_args_for_prompt_line("/prompts:cmd \"with spaces\" simple", "cmd");
-        assert_eq!(args, vec!["with spaces".to_string(), "simple".to_string()]);
+        assert_eq!(
+            args,
+            vec!["with spaces".to_string(), "simple".to_string()]
+        );
     }
 
     #[test]
@@ -3489,7 +3529,7 @@ mod tests {
         let (_result, _needs_redraw) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
-        assert_eq!(composer.textarea.text(), "/compact ");
+        assert_eq!(composer.textarea.text(), "/compact");
         assert_eq!(composer.textarea.cursor(), composer.textarea.text().len());
     }
 
@@ -3505,12 +3545,11 @@ mod tests {
             false,
         );
 
-        // Type a prefix and complete with Tab, which inserts a trailing space
-        // and moves the cursor beyond the '/name' token (hides the popup).
+        // Type a prefix and complete with Tab.
         type_chars_humanlike(&mut composer, &['/', 'd', 'i']);
         let (_res, _redraw) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(composer.textarea.text(), "/diff ");
+        assert_eq!(composer.textarea.text(), "/diff");
 
         // Press Enter: should dispatch the command, not submit literal text.
         let (result, _needs_redraw) =
